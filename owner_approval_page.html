@@ -1,0 +1,223 @@
+<!doctype html>
+<!--
+  Owner approval page (2026-10-26, not deployed). Must be served from an origin that NO credential on the
+  Mac and no connector can write: a dedicated GitHub account whose Pages site hosts only this file. The
+  deployer pins that origin and the passkey created here. The page loads nothing and sends nothing
+  (CSP connect-src 'none'); the request travels in the URL fragment (#z= zlib, or #r= plain), the signed
+  answer is copied by hand into the request issue.
+  What is shown is exactly what is signed: challenge = SHA-256 of the very bytes decoded (and inflated)
+  from the fragment. Diffs are rendered line by line with indentation and tabs visible.
+-->
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; img-src 'none'; form-action 'none'; base-uri 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Owner-Freigabe</title>
+<style>
+  :root { --bg: #fff; --fg: #111; --warn: #fde8e8; --ok: #e6f4ea; --add: #e6ffec; --del: #ffebe9;
+          --hunk: #ddf4ff; --muted: #666; --box: #f6f8fa; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #0d1117; --fg: #e6edf3; --warn: #4b1d1d; --ok: #1d3b26;
+      --add: #12361f; --del: #4b1d1d; --hunk: #13304a; --muted: #9aa4ae; --box: #161b22; }
+  }
+  body { font: 16px -apple-system, sans-serif; margin: 12px 16px; max-width: 60em; background: var(--bg); color: var(--fg); }
+  .warn { background: var(--warn); padding: 8px; border-radius: 6px; }
+  .ok { background: var(--ok); padding: 8px; border-radius: 6px; }
+  .muted { color: var(--muted); font-size: 14px; }
+  .op { border: 1px solid var(--muted); border-radius: 6px; padding: 8px; margin: 12px 0; }
+  pre.diff { font: 12px/1.45 ui-monospace, Menlo, monospace; white-space: pre; overflow-x: auto;
+             background: var(--box); padding: 6px; margin: 6px 0; border-radius: 4px; tab-size: 4; }
+  pre.diff span { display: block; min-width: max-content; }
+  .add { background: var(--add); } .del { background: var(--del); } .hunk { background: var(--hunk); }
+  .note { color: var(--muted); font-style: italic; }
+  .tab { color: var(--muted); }
+  code, textarea { font: 13px ui-monospace, Menlo, monospace; word-break: break-all; }
+  textarea { width: 100%; height: 9em; box-sizing: border-box; }
+  button { font-size: 18px; padding: 10px 16px; margin: 8px 8px 8px 0; }
+  details pre { white-space: pre-wrap; word-break: break-all; font-size: 12px; }
+  label { display: block; margin: 12px 0; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>Owner-Freigabe</h1>
+<div id="out"></div>
+<script>
+"use strict";
+const out = document.getElementById("out");
+
+function el(tag, text, cls, parent) {
+  const e = document.createElement(tag);
+  if (text !== undefined && text !== null) e.textContent = text;
+  if (cls) e.className = cls;
+  (parent || out).appendChild(e);
+  return e;
+}
+function b64uEnc(buf) {
+  let s = "";
+  new Uint8Array(buf).forEach(b => { s += String.fromCharCode(b); });
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64uDec(s) {
+  if (!/^[A-Za-z0-9_-]+$/.test(s)) throw new Error("kein base64url");
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+}
+function hex(buf) {
+  return Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2, "0")).join("");
+}
+async function inflate(bytes) {
+  if (typeof DecompressionStream !== "function") throw new Error("Browser kann den Antrag nicht entpacken");
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+function short(h) { return typeof h === "string" ? h.slice(0, 12) : String(h); }
+
+// One diff line per block element; tabs shown as an arrow, indentation kept (white-space: pre).
+function renderDiff(text, parent) {
+  const pre = el("pre", null, "diff", parent);
+  for (const line of String(text).split("\n")) {
+    if (line === "") continue;
+    let cls = "";
+    if (line.startsWith("+++") || line.startsWith("---")) cls = "note";
+    else if (line.startsWith("@@")) cls = "hunk";
+    else if (line.startsWith("+")) cls = "add";
+    else if (line.startsWith("-")) cls = "del";
+    else if (line.startsWith("\\")) cls = "note";
+    const span = el("span", null, cls, pre);
+    const parts = line.split("\t");
+    parts.forEach((p, i) => {
+      if (i > 0) el("span", "⇥\t", "tab", span).style.display = "inline";
+      span.appendChild(document.createTextNode(p));
+    });
+  }
+  if (!pre.childNodes.length) el("span", "(kein Zeilenunterschied – siehe Hinweise)", "note", pre);
+}
+
+function renderRequest(req) {
+  el("p", "Prüfe jede Zeile der Änderungen. Nur Ziele, Diffs, Aktionen und Ablaufzeit sind maßgeblich.", "warn");
+  el("h2", "Beschreibung des Einreichers (ungeprüft)");
+  el("p", req.summary_untrusted || "(leer)", "muted");
+  el("h2", "Änderungen (" + req.operations.length + " Datei" + (req.operations.length === 1 ? "" : "en") + ")");
+  for (const op of req.operations) {
+    const box = el("div", null, "op");
+    el("strong", op.path, null, box);
+    el("div", (op.after_sha256 === "absent" ? "wird ENTFERNT" :
+              op.before_sha256 === "absent" ? "wird NEU ANGELEGT" : "wird geändert") +
+              " · Modus " + op.mode + " · vorher " + short(op.before_sha256) +
+              " → nachher " + short(op.after_sha256), "muted", box);
+    renderDiff(op.diff, box);
+  }
+  el("h2", "Aktionen danach");
+  if (!req.actions.length) el("p", "keine");
+  for (const a of req.actions) el("code", a.argv.join(" "), null, el("p"));
+  el("h2", "Prüfungen des Deployers");
+  for (const c of req.checks) el("p", c.target + ": " + c.check, "muted");
+  if (req.rollback_of) el("p", "Rückgängigmachen von Antrag " + req.rollback_of, "warn");
+  const raw = el("details");
+  el("summary", "Alle signierten Felder (Rohdaten)", null, raw);
+  el("pre", JSON.stringify(req, null, 2), null, raw);
+}
+
+function showResult(obj, hint) {
+  el("p", hint, "ok");
+  const ta = el("textarea");
+  ta.readOnly = true;
+  ta.value = JSON.stringify(obj);
+  const copy = el("button", "Kopieren");
+  copy.onclick = () => navigator.clipboard.writeText(ta.value);
+}
+
+async function approve(bytes, req) {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  el("p", "Antrag " + req.request_id + " · Prüfsumme " + hex(digest).slice(0, 16) + "…", "muted");
+  const now = Math.floor(Date.now() / 1000);
+  if (typeof req.expires_at !== "number" || req.expires_at <= now) {
+    el("p", "Antrag abgelaufen oder ohne Ablaufzeit. Nicht freigeben.", "warn");
+    return;
+  }
+  el("p", "Gültig bis " + new Date(req.expires_at * 1000).toLocaleString("de-DE"));
+  const label = el("label");
+  const box = el("input", null, null, label);
+  box.type = "checkbox";
+  label.appendChild(document.createTextNode(" Ich habe alle Änderungen oben vollständig gelesen und verstanden."));
+  const btn = el("button", "Genau diesen Antrag mit Face ID freigeben");
+  btn.disabled = true;
+  box.onchange = () => { btn.disabled = !box.checked; };
+  const no = el("button", "Ablehnen");
+  no.onclick = () => {
+    btn.disabled = true; no.disabled = true; box.disabled = true;
+    showResult({ schema: 1, request_id: req.request_id, cancel: true },
+               "Abgelehnt. Diesen Text als Kommentar in das Antrags-Issue kopieren (bricht den Antrag ab):");
+  };
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      const cred = await navigator.credentials.get({ publicKey: {
+        challenge: digest, rpId: location.hostname, userVerification: "required", timeout: 120000 } });
+      no.disabled = true;
+      showResult({
+        schema: 1, request_id: req.request_id, credential_id: b64uEnc(cred.rawId),
+        authenticator_data: b64uEnc(cred.response.authenticatorData),
+        client_data_json: b64uEnc(cred.response.clientDataJSON),
+        signature: b64uEnc(cred.response.signature) },
+        "Freigegeben. Diesen Text vollständig als Kommentar in das Antrags-Issue kopieren:");
+    } catch (e) {
+      el("p", "Abgebrochen: " + e.name, "warn");
+      btn.disabled = !box.checked;
+    }
+  };
+}
+
+async function register() {
+  el("p", "Einrichtung: legt einen Passkey nur für diese Seite an. Nur während des lokalen Bootstraps verwenden.");
+  const btn = el("button", "Passkey anlegen");
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      const cred = await navigator.credentials.create({ publicKey: {
+        rp: { id: location.hostname, name: "Memecoin Owner-Freigabe" },
+        user: { id: crypto.getRandomValues(new Uint8Array(16)), name: "owner", displayName: "Owner" },
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+        authenticatorSelection: { residentKey: "required", userVerification: "required" },
+        attestation: "none", timeout: 120000 } });
+      if (cred.response.getPublicKeyAlgorithm() !== -7) throw new Error("kein ES256");
+      const spki = cred.response.getPublicKey();
+      const fp = hex(await crypto.subtle.digest("SHA-256", spki)).match(/.{4}/g).join(" ");
+      el("p", "Fingerabdruck (muss exakt dem am Mac angezeigten entsprechen):", "ok");
+      el("code", fp);
+      showResult({ credential_id: b64uEnc(cred.rawId), public_key_spki: b64uEnc(spki) },
+                 "Diesen Text in das Einrichtungs-Issue kopieren:");
+    } catch (e) {
+      el("p", "Fehlgeschlagen: " + e.name + " " + e.message, "warn");
+      btn.disabled = false;
+    }
+  };
+}
+
+(async () => {
+  try {
+    if (location.hash === "#register") return register();
+    const m = location.hash.match(/^#([rz])=([A-Za-z0-9_-]+)$/);
+    if (!m) { el("p", "Kein Antrag in der Adresse."); return; }
+    let bytes = b64uDec(m[2]);
+    if (m[1] === "z") bytes = await inflate(bytes);
+    const req = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    if (req === null || typeof req !== "object" || req.type !== "memecoin-protected-deploy-v1" ||
+        !Array.isArray(req.operations) || !Array.isArray(req.actions) || !Array.isArray(req.checks)) {
+      el("p", "Unbekannter oder unvollständiger Antrag. Nicht freigeben.", "warn");
+      return;
+    }
+    renderRequest(req);
+    await approve(bytes, req);
+  } catch (e) {
+    el("p", "Antrag nicht lesbar: " + e.message + ". Nicht freigeben.", "warn");
+  }
+})();
+</script>
+</body>
+</html>
